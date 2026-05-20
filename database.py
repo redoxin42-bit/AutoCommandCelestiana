@@ -1,34 +1,45 @@
 import aiosqlite
-
-DB_PATH = "bot_database.db"
+from config import DB_NAME
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS settings (
+            CREATE TABLE IF NOT EXISTS accounts (
                 user_id INTEGER PRIMARY KEY,
-                target_chat_id INTEGER,
                 phone TEXT,
                 api_id INTEGER,
                 api_hash TEXT,
-                farm_mode TEXT DEFAULT 'manual', -- 'manual' или 'auto'
-                selected_command TEXT,
-                is_running INTEGER DEFAULT 0
+                session_string TEXT,
+                cooldown INTEGER DEFAULT 60,
+                command TEXT DEFAULT '.фарм',
+                monitoring INTEGER DEFAULT 0,
+                chat_id INTEGER,
+                is_farming INTEGER DEFAULT 0
             )
         ''')
         await db.commit()
 
-async def get_settings(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM settings WHERE user_id = ?", (user_id,)) as cursor:
+async def save_account(user_id, phone, api_id, api_hash, session_string):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO accounts (user_id, phone, api_id, api_hash, session_string)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, phone, api_id, api_hash, session_string))
+        await db.commit()
+
+async def get_account(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT * FROM accounts WHERE user_id = ?', (user_id,)) as cursor:
             return await cursor.fetchone()
 
-async def update_settings(user_id: int, **kwargs):
-    async with aiosqlite.connect(DB_PATH) as db:
-        for key, value in kwargs.items():
-            await db.execute(f'''
-                INSERT INTO settings (user_id, {key}) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET {key} = ?
-            ''', (user_id, value, value))
+async def get_all_accounts():
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT * FROM accounts WHERE session_string IS NOT NULL') as cursor:
+            return await cursor.fetchall()
+
+async def update_settings(user_id, **kwargs):
+    async with aiosqlite.connect(DB_NAME) as db:
+        keys = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+        values = list(kwargs.values()) + [user_id]
+        await db.execute(f'UPDATE accounts SET {keys} WHERE user_id = ?', values)
         await db.commit()
