@@ -1,249 +1,314 @@
 import asyncio
-import os
-import aiosqlite
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+import sys
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid
+from aiogram.types import InlineQuery, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
 
-import database as db
-import parser
+from config import BOT_TOKEN
+from database import init_db, save_account, get_account, get_all_accounts, update_settings
 
-# Основной токен твоего управляющего бота
-BOT_TOKEN = "8674930038:AAFKaZuSsn9f85-cmWopcvQL5Hv_GQipWFw"
-
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-userbot_clients = {}  # Храним активные сессии юзерботов в памяти: {user_id: Client}
 
-class AuthStates(StatesGroup):
-    GET_API = State()
-    GET_PHONE = State()
-    GET_CODE = State()
-    GET_CHAT = State()
+temp_clients = {}
+active_clients = {}
+client_tasks = {}
 
-# --- ЛОГИКА АВТОМАТИЗАЦИИ ФАРМА ---
-async def farm_loop(user_id: int):
-    """Цикл автоматического фарма в фоне для конкретного пользователя"""
-    print(f"🚀 Запущен фоновый фарм для пользователя {user_id}")
+class LoginStates(StatesGroup):
+    waiting_for_credentials = State()
+    waiting_for_code = State()
+    waiting_for_password = State()
+
+# --- Фоновые циклы для автофарма и мониторинга ---
+async def farm_loop(user_id, client):
     while True:
-        settings = await db.get_settings(user_id)
-        # Если фарм отключен или не настроен чат — отдыхаем
-        if not settings or not settings['is_running'] or not settings['target_chat_id']:
-            await asyncio.sleep(10)
-            continue
-            
-        client = userbot_clients.get(user_id)
-        if not client or not client.is_connected:
-            await asyncio.sleep(10)
-            continue
-            
         try:
-            chat_id = settings['target_chat_id']
-            # Проверяем, если строка состоит из цифр, делаем int (для ID чатов)
-            if str(chat_id).replace('-', '').isdigit():
-                chat_id = int(chat_id)
-
-            # 1. Запрашиваем актуальный список действий
-            await client.send_message(chat_id, ".отн действия")
-            await asyncio.sleep(4)  # Ждем, пока Celestiana ответит
+            acc = await get_account(user_id)
+            if not acc or not acc[4]: 
+                break
             
-            # Получаем последние сообщения, ищем ответ от Celestiana
-            async for msg in client.get_chat_history(chat_id, limit=3):
-                if msg.text and ("действия" in msg.text or "Премиум" in msg.text):
-                    commands, cooldowns = parser.parse_celestiana_message(msg.text)
-                    
-                    if not commands:
-                        continue
-                        
-                    # Выбираем команду (ручной режим или авто-рандом)
-                    cmd_to_run = None
-                    if settings['farm_mode'] == 'manual':
-                        cmd_to_run = settings['selected_command']
-                    else:
-                        import random
-                        cmd_to_run = random.choice(commands)
-                    
-                    if cmd_to_run and cmd_to_run in cooldowns:
-                        cd_seconds = cooldowns[cmd_to_run]
-                        # 2. Отправляем команду фарма в чат
-                        await client.send_message(chat_id, f".отн {cmd_to_run}")
-                        
-                        # Отправляем лог пользователю в ЛС управляющего бота
-                        try:
-                            await bot.send_message(
-                                user_id, 
-                                f"🤖 **Действие выполнено:** `.отн {cmd_to_run}`\n"
-                                f"⏳ Пауза по КД: `{cd_seconds // 60}м. {cd_seconds % 60}с.`"
-                            )
-                        except Exception:
-                            pass  # Если юзер заблокировал бота
-                            
-                        await asyncio.sleep(cd_seconds)
-                        break
+            is_farming = acc[9]
+            chat_id = acc[8]
+            cooldown = acc[5]
+            command = acc[6]
+            
+            if is_farming and chat_id:
+                await client.send_message(chat_id, command)
+                await asyncio.sleep(cooldown)
+            else:
+                await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            print(f"Ошибка в цикле фарма у юзера {user_id}: {e}")
+            await asyncio.sleep(5)
+
+async def monitoring_loop(user_id, client):
+    while True:
+        try:
+            acc = await get_account(user_id)
+            if not acc or not acc[4]:
+                break
             
-        await asyncio.sleep(300)  # Стандартный цикл проверки (5 минут), если команда не отправилась
+            monitoring = acc[7]
+            chat_id = acc[8]
+            
+            if monitoring and chat_id:
+                await client.send_message(chat_id, ".отн поцеловать")
+                await asyncio.sleep(25 * 60)  # 25 минут
+            else:
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            await asyncio.sleep(5)
 
-# --- ВОССТАНОВЛЕНИЕ СЕССИЙ ПРИ ПЕРЕЗАПУСКЕ БОТА ---
-async def restore_all_sessions():
-    """Поднимает всех активных юзерботов из базы данных при перезапуске скрипта"""
-    await db.init_db()
-    async with aiosqlite.connect(db.DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM settings WHERE is_running = 1") as cursor:
-            rows = await cursor.fetchall()
-            for row in rows:
-                user_id = row['user_id']
-                # Проверяем, существует ли файл сессии для этого юзера
-                if os.path.exists(f"session_{user_id}.session") and row['api_id'] and row['api_hash']:
-                    print(f"Включаю юзербота для игрока {user_id}...")
-                    try:
-                        client = Client(f"session_{user_id}", api_id=row['api_id'], api_hash=row['api_hash'])
-                        await client.connect()
-                        userbot_clients[user_id] = client
-                        asyncio.create_task(farm_loop(user_id))
-                    except Exception as e:
-                        print(f"Не удалось восстановить сессию {user_id}: {e}")
-
-# --- ХЕНДЛЕРЫ AIOGRAM ---
-@dp.message(F.text == "/start")
-async def cmd_start(message: Message, state: FSMContext):
-    await db.init_db()
-    await message.answer(
-        "👋 Привет! Этот бот поможет тебе автоматизировать действия в Celestiana.\n\n"
-        "Для начала настройки введи свой **API ID** и **API HASH** через пробел.\n"
-        "_(Получить их можно на сайте my.telegram.org)_"
+# --- Динамический запуск юзербота ---
+async def start_userbot(user_id, session_string, api_id, api_hash):
+    from pyrogram import Client, filters
+    
+    client = Client(
+        name=f"session_{user_id}",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=session_string,
+        in_memory=True
     )
-    await state.set_state(AuthStates.GET_API)
-
-@dp.message(AuthStates.GET_API)
-async def process_api(message: Message, state: FSMContext):
-    try:
-        api_id, api_hash = message.text.split()
-        await state.update_data(api_id=int(api_id), api_hash=api_hash)
-        await message.answer("Получено! Теперь введи номер телефона от этого аккаунта (например, +79991234567):")
-        await state.set_state(AuthStates.GET_PHONE)
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введи API ID (цифры) и API HASH через пробел в одном сообщении!")
-
-@dp.message(AuthStates.GET_PHONE)
-async def process_phone(message: Message, state: FSMContext):
-    phone = message.text.strip()
-    data = await state.get_data()
     
-    await message.answer("🔄 Подключаюсь к Telegram для отправки кода подтверждения...")
-    
-    client = Client(f"session_{message.from_user.id}", api_id=data['api_id'], api_hash=data['api_hash'])
-    try:
-        await client.connect()
-        code_hash = await client.send_code(phone)
-        await state.update_data(phone=phone, code_hash=code_hash.phone_code_hash, client=client)
-        userbot_clients[message.from_user.id] = client
-        await message.answer("📩 Код подтверждения отправлен в твой Telegram. Введи его сюда:")
-        await state.set_state(AuthStates.GET_CODE)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка отправки кода: {e}\nПопробуй заново через /start")
-        await client.disconnect()
-        await state.clear()
-
-@dp.message(AuthStates.GET_CODE)
-async def process_code(message: Message, state: FSMContext):
-    data = await state.get_data()
-    client = data['client']
-    code = message.text.strip().replace(" ", "")  # Убираем пробелы, если юзер скопировал "123 45"
-    
-    try:
-        await client.sign_in(data['phone'], data['code_hash'], code)
-        await message.answer("✅ Авторизация успешна!\nТеперь отправь мне ID чата (или username группы), где вы играете в Celestiana:")
-        await state.set_state(AuthStates.GET_CHAT)
-    except PhoneCodeInvalid:
-        await message.answer("❌ Неверный код. Попробуй ввести еще раз:")
-    except SessionPasswordNeeded:
-        await message.answer("🔒 На аккаунте стоит двухэтапный пароль (2FA). Пожалуйста, временно отключи его в настройках Telegram и начни настройку заново через /start.")
-        await client.disconnect()
-        await state.clear()
-
-@dp.message(AuthStates.GET_CHAT)
-async def process_chat(message: Message, state: FSMContext):
-    chat_input = message.text.strip()
-    data = await state.get_data()
-    
-    # Сохраняем ВСЕ данные пользователя в БД, включая его личные API_ID и API_HASH
-    await db.update_settings(
-        message.from_user.id, 
-        target_chat_id=chat_input, 
-        phone=data['phone'],
-        api_id=data['api_id'],
-        api_hash=data['api_hash'],
-        is_running=1
-    )
-    await state.clear()
-    
-    # Запускаем персональный фоновый процесс для этого пользователя
-    asyncio.create_task(farm_loop(message.from_user.id))
-    
-    await message.answer("🎉 Настройка полностью завершена! Бот включен.\nИспользуй команду /main для переключения режимов.")
-
-@dp.message(F.text == "/main")
-async def cmd_main(message: Message):
-    settings = await db.get_settings(message.from_user.id)
-    if not settings:
-        return await message.answer("Ты еще не настроил бота. Напиши /start")
+    @client.on_message(filters.me & filters.text)
+    async def userbot_handler(cl, msg):
+        text = msg.text.strip()
         
-    kb = [
-        [KeyboardButton(text="🔄 Режим: Авто-рандом"), KeyboardButton(text="🎯 Режим: Ручной выбор")],
-        [KeyboardButton(text="🛑 Остановить фарм"), KeyboardButton(text="▶️ Запустить фарм")]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+        if text.startswith('.main'):
+            await msg.delete()
+            await update_settings(user_id, chat_id=msg.chat.id)
+            bot_info = await bot.get_me()
+            try:
+                res = await cl.get_inline_bot_results(bot_info.username, "menu")
+                if res and res.results:
+                    await cl.send_inline_bot_result(msg.chat.id, res.query_id, res.results[0].id)
+            except Exception as e:
+                await cl.send_message(msg.chat.id, f"❌ Включи Inline Mode в @BotFather для бота!\nОшибка: {e}")
+                
+        elif text.startswith('.cooldown '):
+            try:
+                cd = int(text.split()[1])
+                await update_settings(user_id, cooldown=cd)
+                await msg.reply_text(f"✅ КД успешно изменено на {cd} сек.")
+            except:
+                await msg.reply_text("❌ Формат: `.cooldown [секунды]`")
+                
+        elif text.startswith('.command '):
+            try:
+                cmd = text.split(maxsplit=1)[1]
+                await update_settings(user_id, command=cmd)
+                await msg.reply_text(f"✅ Команда изменена на: `{cmd}`")
+            except:
+                await msg.reply_text("❌ Формат: `.command [текст команды]`")
+                
+        elif text.startswith('.monitoring'):
+            acc = await get_account(user_id)
+            new_st = 1 if not acc[7] else 0
+            await update_settings(user_id, monitoring=new_st)
+            await msg.reply_text(f"🔄 Мониторинг (.отн поцеловать): {'ВКЛ' if new_st else 'ВЫКЛ'}")
+
+    await client.start()
+    active_clients[user_id] = client
     
-    status = "🟢 РАБОТАЕТ" if settings['is_running'] else "🔴 ОСТАНОВЛЕН"
+    t1 = asyncio.create_task(farm_loop(user_id, client))
+    t2 = asyncio.create_task(monitoring_loop(user_id, client))
+    client_tasks[user_id] = [t1, t2]
+
+# --- Aiogram Хендлеры ---
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message, state: FSMContext):
     await message.answer(
-        f"⚙️ **Панель управления Celestiana**\n\n"
-        f"Статус авто-фарма: `{status}`\n"
-        f"Режим выбора команд: `{settings['farm_mode']}`\n"
-        f"Выбранное действие: `{settings['selected_command'] or 'Не выбрано'}`\n\n"
-        f"💡 Если включен ручной режим, просто пришли мне точное название действия текстом (например: `Квантовое слияние`), чтобы бот спамил именно его.",
-        reply_markup=markup
+        "👋 **Привет! Подключим твой аккаунт Telegram.**\n\n"
+        "Отправь данные одной строкой через пробел в формате:\n"
+        "`номер_телефона api_id api_hash`\n\n"
+        "Пример:\n`79991112233 1234567 abcdef1234567890` (без знака +)",
+        parse_mode="Markdown"
+    )
+    await state.set_state(LoginStates.waiting_for_credentials)
+
+@dp.message(LoginStates.waiting_for_credentials)
+async def process_credentials(message: types.Message, state: FSMContext):
+    try:
+        parts = message.text.split()
+        if len(parts) < 3:
+            return await message.answer("❌ Неверный формат. Введи: `номер api_id api_hash`")
+        
+        phone, api_id, api_hash = parts[0], int(parts[1]), parts[2]
+        await state.update_data(phone=phone, api_id=api_id, api_hash=api_hash)
+        
+        from pyrogram import Client
+        client = Client(f"temp_{message.from_user.id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+        await client.connect()
+        
+        code_hash = await client.send_code(phone)
+        temp_clients[message.from_user.id] = {"client": client, "code_hash": code_hash.phone_code_hash}
+        
+        await message.answer("📩 Код авторизации отправлен. Введи его сюда:")
+        await state.set_state(LoginStates.waiting_for_code)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки кода: {e}\nНачни заново через /start")
+        await state.clear()
+
+@dp.message(LoginStates.waiting_for_code)
+async def process_code(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id not in temp_clients:
+        return await message.answer("Сессия устарела. Напиши /start")
+        
+    code = message.text.strip()
+    data = await state.get_data()
+    client = temp_clients[user_id]["client"]
+    code_hash = temp_clients[user_id]["code_hash"]
+    
+    from pyrogram.errors import SessionPasswordNeeded
+    try:
+        await client.sign_in(data["phone"], code_hash, code)
+        session_str = await client.export_session_string()
+        await save_account(user_id, data["phone"], data["api_id"], data["api_hash"], session_str)
+        
+        await message.answer("🎉 Успешный вход! Юзербот запущен. Теперь в любом чате пиши `.main`")
+        await start_userbot(user_id, session_str, data["api_id"], data["api_hash"])
+        
+        await client.disconnect()
+        temp_clients.pop(user_id, None)
+        await state.clear()
+    except SessionPasswordNeeded:
+        await message.answer("🔐 На аккаунте обнаружен 2FA пароль. Введи его:")
+        await state.set_state(LoginStates.waiting_for_password)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка авторизации: {e}")
+        await client.disconnect()
+        temp_clients.pop(user_id, None)
+        await state.clear()
+
+@dp.message(LoginStates.waiting_for_password)
+async def process_password(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id not in temp_clients:
+        return await message.answer("Сессия устарела. Напиши /start")
+        
+    password = message.text.strip().replace(" ", "")  # Обработка "4 4 4 4" -> "4444"
+    data = await state.get_data()
+    client = temp_clients[user_id]["client"]
+    
+    try:
+        await client.check_password(password)
+        session_str = await client.export_session_string()
+        await save_account(user_id, data["phone"], data["api_id"], data["api_hash"], session_str)
+        
+        await message.answer("🎉 Успешный вход (с 2FA)! Автофарм готов к работе.")
+        await start_userbot(user_id, session_str, data["api_id"], data["api_hash"])
+        
+        await client.disconnect()
+        temp_clients.pop(user_id, None)
+        await state.clear()
+    except Exception as e:
+        await message.answer(f"❌ Неверный пароль или ошибка: {e}\nНачни заново через /start")
+        await client.disconnect()
+        temp_clients.pop(user_id, None)
+        await state.clear()
+
+# --- Логика обработки Inline-меню ---
+def generate_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="▶️ Старт Фарм", callback_data="farm_start"),
+            InlineKeyboardButton(text="⏸ Стоп Фарм", callback_data="farm_stop")
+        ],
+        [
+            InlineKeyboardButton(text="💕 Мониторинг (Вкл/Выкл)", callback_data="toggle_monitor")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Обновить статус", callback_data="refresh_menu")
+        ]
+    ])
+
+async def build_menu_text(user_id):
+    acc = await get_account(user_id)
+    if not acc:
+        return "Аккаунт не зарегистрирован в боте."
+    cooldown = acc[5]
+    command = acc[6]
+    monitoring = "ВКЛ" if acc[7] else "ВЫКЛ"
+    is_farming = "АКТИВЕН" if acc[9] else "НА ПАУЗЕ"
+    
+    return (
+        f"📊 **Menu Autofarm**\n\n"
+        f"⏱ **КД фарма:** {cooldown} сек.\n"
+        f"💬 **Команда отправки:** `{command}`\n"
+        f"💕 **Мониторинг:** {monitoring} (каждые 25 мин)\n"
+        f"⚡ **Статус автофарма:** __{is_farming}__\n\n"
+        f"⚙️ Используй кнопки ниже или команды `.cooldown`, `.command`, `.monitoring`"
     )
 
-@dp.message(F.text == "🔄 Режим: Авто-рандом")
-async def set_auto(message: Message):
-    await db.update_settings(message.from_user.id, farm_mode='auto')
-    await message.answer("🤖 Режим изменен. Бот будет сам выбирать случайную доступную команду из списка.")
+@dp.inline_query()
+async def inline_handler(inline_query: InlineQuery):
+    user_id = inline_query.from_user.id
+    text = await build_menu_text(user_id)
+    
+    results = [
+        InlineQueryResultArticle(
+            id="menu",
+            title="Menu Autofarm",
+            input_message_content=InputTextMessageContent(message_text=text, parse_mode="Markdown"),
+            reply_markup=generate_menu_keyboard()
+        )
+    ]
+    await inline_query.answer(results, cache_time=1, is_personal=True)
 
-@dp.message(F.text == "🎯 Режим: Ручной выбор")
-async def set_manual(message: Message):
-    await db.update_settings(message.from_user.id, farm_mode='manual')
-    await message.answer("🎯 Режим изменен. Напиши мне название команды текстом, чтобы зафиксировать её.")
+@dp.callback_query()
+async def callback_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    acc = await get_account(user_id)
+    if not acc:
+        return await callback.answer("Аккаунт не найден.", show_alert=True)
+        
+    action = callback.data
+    if action == "farm_start":
+        await update_settings(user_id, is_farming=1)
+        await callback.answer("Автофарм запущен!")
+    elif action == "farm_stop":
+        await update_settings(user_id, is_farming=0)
+        await callback.answer("Автофарм приостановлен.")
+    elif action == "toggle_monitor":
+        new_status = 1 if not acc[7] else 0
+        await update_settings(user_id, monitoring=new_status)
+        await callback.answer(f"Мониторинг: {'ВКЛ' if new_status else 'ВЫКЛ'}")
+    elif action == "refresh_menu":
+        await callback.answer("Статус обновлен!")
+        
+    new_text = await build_menu_text(user_id)
+    try:
+        await callback.message.edit_text(new_text, reply_markup=generate_menu_keyboard(), parse_mode="Markdown")
+    except:
+        pass
 
-@dp.message(F.text == "🛑 Остановить фарм")
-async def stop_farm(message: Message):
-    await db.update_settings(message.from_user.id, is_running=0)
-    await message.answer("⏸️ Фарм успешно остановлен.")
-
-@dp.message(F.text == "▶️ Запустить фарм")
-async def start_farm(message: Message):
-    await db.update_settings(message.from_user.id, is_running=1)
-    await message.answer("▶️ Фарм возобновлен.")
-
-@dp.message()
-async def save_manual_command(message: Message):
-    settings = await db.get_settings(message.from_user.id)
-    if settings and settings['farm_mode'] == 'manual':
-        cmd = message.text.strip().replace("«", "").replace("»", "")
-        await db.update_settings(message.from_user.id, selected_command=cmd)
-        await message.answer(f"✅ Команда сохранена! Буду циклично отправлять: `.отн {cmd}`")
+# --- Восстановление сессий при перезапуске бота ---
+async def on_startup_restore():
+    await init_db()
+    accounts = await get_all_accounts()
+    for acc in accounts:
+        uid, phone, api_id, api_hash, session_str = acc[0], acc[1], acc[2], acc[3], acc[4]
+        try:
+            await start_userbot(uid, session_str, api_id, api_hash)
+            print(f" Юзербот для {uid} успешно перезапущен")
+        except Exception as e:
+            print(f" Не удалось восстановить сессию {uid}: {e}")
 
 async def main():
-    # При старте скрипта автоматически восстанавливаем сессии всех, у кого был включен фарм
-    await restore_all_sessions()
-    print("🤖 Основной управляющий бот запущен и слушает команды...")
+    await on_startup_restore()
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
